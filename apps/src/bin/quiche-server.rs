@@ -27,9 +27,11 @@
 #[macro_use]
 extern crate log;
 
-use std::net;
+use std::cmp;
 
 use std::io;
+
+use std::net;
 
 use std::io::prelude::*;
 
@@ -45,13 +47,19 @@ use quiche_apps::args::*;
 
 use quiche_apps::common::*;
 
+use quiche_apps::sendto::*;
+
+// Maximum size of the send buffer. 65507 is the maximum
+// buffer size of linux gso sendmsg().
+const MAX_BUF_SIZE: usize = 65507;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-const MAX_SEND_BURST_LIMIT: usize = MAX_DATAGRAM_SIZE * 10;
+const MAX_SEND_BURST_PACKETS: usize = 10;
 
 fn main() {
-    let mut buf = [0; 65535];
-    let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut buf = [0; MAX_BUF_SIZE];
+    let mut out = [0; MAX_BUF_SIZE];
     let mut pacing = false;
 
     env_logger::builder()
@@ -91,6 +99,11 @@ fn main() {
     )
     .unwrap();
 
+    let max_datagram_size = MAX_DATAGRAM_SIZE;
+    let enable_gso = detect_gso(&socket, max_datagram_size);
+
+    trace!("GSO detected: {}", enable_gso);
+
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
@@ -100,8 +113,8 @@ fn main() {
     config.set_application_protos(&conn_args.alpns).unwrap();
 
     config.set_max_idle_timeout(conn_args.idle_timeout);
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_recv_udp_payload_size(max_datagram_size);
+    config.set_max_send_udp_payload_size(max_datagram_size);
     config.set_initial_max_data(conn_args.max_data);
     config.set_initial_max_stream_data_bidi_local(conn_args.max_stream_data);
     config.set_initial_max_stream_data_bidi_remote(conn_args.max_stream_data);
@@ -357,7 +370,7 @@ fn main() {
                     partial_responses: HashMap::new(),
                     siduck_conn: None,
                     app_proto_selected: false,
-                    bytes_sent: 0,
+                    max_datagram_size,
                 };
 
                 clients.insert(scid.clone(), client);
@@ -431,6 +444,10 @@ fn main() {
 
                     client.app_proto_selected = true;
                 }
+
+                // Update max_datagram_size after connection established.
+                client.max_datagram_size =
+                    client.conn.max_send_udp_payload_size();
             }
 
             if client.http_conn.is_some() {
@@ -474,8 +491,18 @@ fn main() {
         // packets to be sent.
         continue_write = false;
         for client in clients.values_mut() {
-            loop {
-                let (write, send_info) = match client.conn.send(&mut out) {
+            let max_send_burst = cmp::min(
+                MAX_BUF_SIZE,
+                client.max_datagram_size * MAX_SEND_BURST_PACKETS,
+            );
+            let mut total_write = 0;
+            let mut dst_info = None;
+
+            while total_write < max_send_burst {
+                let (write, send_info) = match client
+                    .conn
+                    .send(&mut out[total_write..max_send_burst])
+                {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
@@ -491,33 +518,41 @@ fn main() {
                     },
                 };
 
-                // TODO: coalesce packets.
-                if let Err(e) =
-                    send_to(&socket, &out[..write], &send_info, pacing)
-                {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        trace!("send() would block");
-                        break;
-                    }
+                total_write += write;
 
-                    panic!("send() failed: {:?}", e);
-                }
+                dst_info = Some(send_info);
 
-                trace!("{} written {} bytes", client.conn.trace_id(), write);
-
-                // limit write bursting
-                client.bytes_sent += write;
-
-                if client.bytes_sent >= MAX_SEND_BURST_LIMIT {
-                    trace!(
-                        "{} pause writing at {}",
-                        client.conn.trace_id(),
-                        client.bytes_sent
-                    );
-                    client.bytes_sent = 0;
-                    continue_write = true;
+                if write < client.max_datagram_size {
                     break;
                 }
+            }
+
+            if total_write == 0 || dst_info.is_none() {
+                break;
+            }
+
+            if let Err(e) = send_to(
+                &socket,
+                &out[..total_write],
+                &dst_info.unwrap(),
+                client.max_datagram_size,
+                pacing,
+                enable_gso,
+            ) {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    trace!("send() would block");
+                    break;
+                }
+
+                panic!("send_to() failed: {:?}", e);
+            }
+
+            trace!("{} written {} bytes", client.conn.trace_id(), total_write);
+
+            if total_write >= max_send_burst {
+                trace!("{} pause writing", client.conn.trace_id(),);
+                continue_write = true;
+                break;
             }
         }
 
@@ -625,65 +660,4 @@ fn set_txtime_sockopt(_: &net::UdpSocket) -> io::Result<()> {
         ErrorKind::Other,
         "Not supported on this platform",
     ))
-}
-
-/// Send outgoing UDP packet to kernel using sendmsg syscall
-///
-/// sendmsg syscall also includes the time the packet needs to be
-/// sent by the kernel in msghdr.
-///
-/// Note that sendmsg syscall is used only on linux platforms.
-#[cfg(target_os = "linux")]
-fn send_to(
-    sock: &mio::net::UdpSocket, send_buf: &[u8], send_info: &quiche::SendInfo,
-    pacing: bool,
-) -> io::Result<usize> {
-    use nix::sys::socket::sendmsg;
-    use nix::sys::socket::ControlMessage;
-    use nix::sys::socket::InetAddr;
-    use nix::sys::socket::MsgFlags;
-    use nix::sys::socket::SockAddr;
-    use nix::sys::uio::IoVec;
-    use std::os::unix::io::AsRawFd;
-
-    if !pacing {
-        return sock.send_to(send_buf, &send_info.to);
-    }
-
-    let nanos_per_sec: u64 = 1_000_000_000;
-    let sockfd = sock.as_raw_fd();
-    let len = send_buf.len();
-    let iov = [IoVec::from_slice(&send_buf[..len])];
-
-    let mut time_spec = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            &send_info.at as *const _ as *const libc::timespec,
-            &mut time_spec,
-            1,
-        )
-    };
-
-    let send_time =
-        time_spec.tv_sec as u64 * nanos_per_sec + time_spec.tv_nsec as u64;
-
-    let cmsg = ControlMessage::TxTime(&send_time);
-    let addr = SockAddr::new_inet(InetAddr::from_std(&send_info.to));
-
-    match sendmsg(sockfd, &iov, &[cmsg], MsgFlags::empty(), Some(&addr)) {
-        Ok(written) => Ok(written),
-        Err(e) => Err(e.into()),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn send_to(
-    sock: &mio::net::UdpSocket, send_buf: &[u8], send_info: &quiche::SendInfo,
-    _: bool,
-) -> io::Result<usize> {
-    sock.send_to(send_buf, &send_info.to)
 }
