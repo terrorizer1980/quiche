@@ -364,6 +364,8 @@ fn main() {
 
                         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 
+                        Ok((_flow_id, quiche::h3::Event::PriorityUpdate)) => (),
+
                         Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
 
                         Err(quiche::h3::Error::Done) => {

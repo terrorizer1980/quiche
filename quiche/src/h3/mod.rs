@@ -170,6 +170,8 @@
 //!
 //!         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 //!
+//!         Ok((_flow_id, quiche::h3::Event::PriorityUpdate)) => (),
+//!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
 //!              // Peer signalled it is going away, handle it.
 //!         },
@@ -229,6 +231,8 @@
 //!         },
 //!
 //!         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
+//!
+//!         Ok((_flow_id, quiche::h3::Event::PriorityUpdate)) => (),
 //!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
 //!              // Peer signalled it is going away, handle it.
@@ -599,6 +603,22 @@ pub enum Event {
     /// [`Done`]: enum.Error.html#variant.Done
     Datagram,
 
+    /// PRIORITY_UPDATE was received.
+    ///
+    /// This indicates that the application can use the
+    /// [`recv_priority_update()`] method to retrieve a PRIORITY_UPDATE received
+    /// on the control stream.
+    ///
+    /// Note that [`recv_priority_update()`] will retrieve only the single
+    /// latest PRIORITY_UPDATE frame targeting a specific stream. However, the
+    /// method needs to be called repeatedly until the [`Done`] value is
+    /// returned, as the event will not be re-armed until all buffered
+    /// PRIORITY_UPDATES are read.
+    ///
+    /// [`recv_priority_update()`]: struct.Connection.html#method.recv_body
+    /// [`Done`]: enum.Error.html#variant.Done
+    PriorityUpdate,
+
     /// GOAWAY was received.
     GoAway,
 }
@@ -647,6 +667,9 @@ pub struct Connection {
     peer_goaway_id: Option<u64>,
 
     dgram_event_triggered: bool,
+
+    priority_event_triggered: bool,
+    priority_updates: crate::stream::StreamIdHashMap<Vec<u8>>,
 }
 
 impl Connection {
@@ -707,6 +730,9 @@ impl Connection {
             peer_goaway_id: None,
 
             dgram_event_triggered: false,
+
+            priority_event_triggered: false,
+            priority_updates: Default::default(),
         })
     }
 
@@ -785,7 +811,7 @@ impl Connection {
         // the creation of the QUIC stream state, without actually writing
         // anything.
         if let Err(e) = conn.stream_send(stream_id, b"", false) {
-            self.streams.remove(&stream_id);
+            self.cleanup_stream_references(stream_id);
 
             if e == super::Error::Done {
                 return Err(Error::StreamBlocked);
@@ -935,7 +961,7 @@ impl Connection {
 
             Err(e) => {
                 if conn.stream_finished(stream_id) {
-                    self.streams.remove(&stream_id);
+                    self.cleanup_stream_references(stream_id);
                 }
 
                 return Err(e.into());
@@ -963,7 +989,7 @@ impl Connection {
         }
 
         if fin && conn.stream_finished(stream_id) {
-            self.streams.remove(&stream_id);
+            self.cleanup_stream_references(stream_id);
         }
 
         Ok(())
@@ -1019,7 +1045,7 @@ impl Connection {
 
             Err(e) => {
                 if conn.stream_finished(stream_id) {
-                    self.streams.remove(&stream_id);
+                    self.cleanup_stream_references(stream_id);
                 }
 
                 return Err(e.into());
@@ -1067,7 +1093,7 @@ impl Connection {
         let written = conn.stream_send(stream_id, &body[..body_len], fin)?;
 
         if fin && written == body.len() && conn.stream_finished(stream_id) {
-            self.streams.remove(&stream_id);
+            self.cleanup_stream_references(stream_id);
         }
 
         Ok(written)
@@ -1236,6 +1262,41 @@ impl Connection {
         }
 
         Ok(total)
+    }
+
+    /// Returns values contained in PRIORITY_UPDATE frame.
+    ///
+    /// Applications should call this method whenever the [`poll()`] method
+    /// returns a [`PriorityUpdate`] event.
+    ///
+    /// On success a tuple containing the prioritized element ID and the
+    /// priority field value is returned, or [`Done`] if there is no
+    /// PRIORITY_UPDATE to read.
+    ///
+    /// [`poll()`]: struct.Connection.html#method.poll
+    /// [`PriorityUpdate`]: enum.Event.html#variant.PriorityUpdate
+    /// [`Done`]: enum.Error.html#variant.Done
+    pub fn recv_priority_update(&mut self) -> Result<(u64, Vec<u8>)> {
+        let maybe_update = self.priority_updates.keys().take(1).copied().next();
+
+        match maybe_update {
+            Some(v) => {
+                // safe to unwrap here because we know the entry's key exists
+                Ok(self.priority_updates.remove_entry(&v).unwrap())
+            },
+
+            None => {
+                // The PRIORITY_UPDATE frames have all been read, so rearm the
+                // trigger.
+                self.priority_event_triggered = false;
+                Err(Error::Done)
+            },
+        }
+    }
+
+    fn cleanup_stream_references(&mut self, stream_id: u64) {
+        self.streams.remove(&stream_id);
+        self.priority_updates.remove(&stream_id);
     }
 
     /// Processes HTTP/3 data received from the peer.
@@ -1495,7 +1556,7 @@ impl Connection {
 
             Err(e) => {
                 if conn.stream_finished(stream_id) {
-                    self.streams.remove(&stream_id);
+                    self.cleanup_stream_references(stream_id);
                 }
 
                 return Err(e.into());
@@ -2114,7 +2175,7 @@ impl Connection {
 
             frame::Frame::PriorityUpdateRequest {
                 prioritized_element_id,
-                ..
+                priority_field_value,
             } => {
                 if !self.is_server {
                     conn.close(
@@ -2146,7 +2207,36 @@ impl Connection {
                     return Err(Error::FrameUnexpected);
                 }
 
-                // TODO: decide how to handle valid frames: generate an event?
+                if prioritized_element_id > conn.local_max_streams_bidi() * 4 {
+                    conn.close(
+                        true,
+                        Error::IdError.to_wire(),
+                        b"PRIORITY_UPDATE for request stream beyond max streams limit",
+                    )?;
+
+                    return Err(Error::IdError);
+                }
+
+                // If the PRIORITY_UPDATE is valid, consider storing the latest
+                // contents. Due to reordering, it is possible that we might
+                // receive frames that reference streams that have not yet to
+                // been opened and that's OK because it's within our concurrency
+                // limit. However, we discard PRIORITY_UPDATE that refers to
+                // streams that we know have been collected.
+                if conn.is_stream_collected(prioritized_element_id) {
+                    return Err(Error::Done);
+                }
+
+                self.priority_updates
+                    .insert(prioritized_element_id, priority_field_value);
+
+                if self.priority_event_triggered {
+                    return Err(Error::Done);
+                }
+
+                self.priority_event_triggered = true;
+
+                return Ok((0, Event::PriorityUpdate));
             },
 
             frame::Frame::PriorityUpdatePush {
@@ -3238,6 +3328,280 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Send a PRIORITY_UPDATE for request stream from the client.
+    fn priority_update_single_stream_rearm() {
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=3".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // Once the PriorityUpdate event was fired, subsequent frames will not
+        // rearm it.
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=5".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // There is only one PRIORITY_UPDATE frame to read. Once read the event
+        // will rearm ready for more.
+        assert_eq!(s.server.recv_priority_update(), Ok((0, b"u=5".to_vec())));
+        assert_eq!(s.server.recv_priority_update(), Err(Error::Done));
+
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=7".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        assert_eq!(s.server.recv_priority_update(), Ok((0, b"u=7".to_vec())));
+        assert_eq!(s.server.recv_priority_update(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Send multiple PRIORITY_UPDATE frames for different streams from the
+    /// client across multiple flights of exchange.
+    fn priority_update_request_multiple_stream_rearm_multiple_flights() {
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=3".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // Read the frame but don't try to read again, so that the
+        // PriorityUpdate trigger stays unarmed.
+        assert_eq!(s.server.recv_priority_update(), Ok((0, b"u=3".to_vec())));
+
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 4,
+                priority_field_value: b"u=1".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(s.server.recv_priority_update(), Ok((4, b"u=1".to_vec())));
+
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 8,
+                priority_field_value: b"u=2".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(s.poll_server(), Err(Error::Done));
+        assert_eq!(s.server.recv_priority_update(), Ok((8, b"u=2".to_vec())));
+        assert_eq!(s.server.recv_priority_update(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Send multiple PRIORITY_UPDATE frames for different streams from the
+    /// client across a single flight.
+    fn priority_update_request_multiple_stream_rearm_single_flight() {
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        let mut d = [42; 65535];
+
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let p1 = frame::Frame::PriorityUpdateRequest {
+            prioritized_element_id: 0,
+            priority_field_value: b"u=3".to_vec(),
+        };
+
+        let p2 = frame::Frame::PriorityUpdateRequest {
+            prioritized_element_id: 4,
+            priority_field_value: b"u=3".to_vec(),
+        };
+
+        let p3 = frame::Frame::PriorityUpdateRequest {
+            prioritized_element_id: 8,
+            priority_field_value: b"u=3".to_vec(),
+        };
+
+        p1.to_bytes(&mut b).unwrap();
+        p2.to_bytes(&mut b).unwrap();
+        p3.to_bytes(&mut b).unwrap();
+
+        let off = b.off();
+        s.pipe
+            .client
+            .stream_send(s.client.control_stream_id.unwrap(), &d[..off], false)
+            .unwrap();
+
+        s.advance().ok();
+
+        assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        assert_eq!(s.server.recv_priority_update(), Ok((0, b"u=3".to_vec())));
+        assert_eq!(s.server.recv_priority_update(), Ok((4, b"u=3".to_vec())));
+        assert_eq!(s.server.recv_priority_update(), Ok((8, b"u=3".to_vec())));
+
+        assert_eq!(s.server.recv_priority_update(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Send a PRIORITY_UPDATE for a request stream, before and after the stream
+    /// has been completed.
+    fn priority_update_request_collected_completed() {
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=3".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        let (stream, req) = s.send_request(true).unwrap();
+        let ev_headers = Event::Headers {
+            list: req,
+            has_body: false,
+        };
+
+        // Priority event is generated before request headers.
+        assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        assert_eq!(s.server.recv_priority_update(), Ok((0, b"u=3".to_vec())));
+        assert_eq!(s.server.recv_priority_update(), Err(Error::Done));
+
+        let resp = s.send_response(stream, true).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: resp,
+            has_body: false,
+        };
+
+        assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        // Now send a PRIORITY_UPDATE for the completed request stream.
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=3".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        // No event generated at server
+        assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Send a PRIORITY_UPDATE for a request stream, before and after the stream
+    /// has been stopped.
+    fn priority_update_request_collected_stopped() {
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=3".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        let (stream, req) = s.send_request(false).unwrap();
+        let ev_headers = Event::Headers {
+            list: req,
+            has_body: true,
+        };
+
+        // Priority event is generated before request headers.
+        assert_eq!(s.poll_server(), Ok((0, Event::PriorityUpdate)));
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        assert_eq!(s.server.recv_priority_update(), Ok((0, b"u=3".to_vec())));
+        assert_eq!(s.server.recv_priority_update(), Err(Error::Done));
+
+        s.pipe
+            .client
+            .stream_shutdown(stream, crate::Shutdown::Write, 0x100)
+            .unwrap();
+        s.pipe
+            .client
+            .stream_shutdown(stream, crate::Shutdown::Read, 0x100)
+            .unwrap();
+
+        s.advance().ok();
+
+        assert_eq!(s.poll_server(), Ok((0, Event::Reset(0x100))));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // Now send a PRIORITY_UPDATE for the closed request stream.
+        s.send_frame_client(
+            frame::Frame::PriorityUpdateRequest {
+                prioritized_element_id: 0,
+                priority_field_value: b"u=3".to_vec(),
+            },
+            s.client.control_stream_id.unwrap(),
+            false,
+        )
+        .unwrap();
+
+        // No event generated at server
         assert_eq!(s.poll_server(), Err(Error::Done));
     }
 

@@ -1222,6 +1222,10 @@ impl HttpConn for Http3Conn {
                     }
                 },
 
+                Ok((_dummy_id, quiche::h3::Event::PriorityUpdate)) => {
+                    info!("{} PRIORITY_UPDATE triggered", conn.trace_id(),);
+                },
+
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {
                     info!(
                         "{} got GOAWAY with ID {} ",
@@ -1372,6 +1376,10 @@ impl HttpConn for Http3Conn {
                             buf[flow_id_len..len].to_vec()
                         );
                     }
+                },
+
+                Ok((_dummy_id, quiche::h3::Event::PriorityUpdate)) => {
+                    info!("{} PRIORITY_UPDATE triggered", conn.trace_id(),);
                 },
 
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {

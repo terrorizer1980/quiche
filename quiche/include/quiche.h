@@ -668,6 +668,7 @@ enum quiche_h3_event_type {
     QUICHE_H3_EVENT_DATAGRAM,
     QUICHE_H3_EVENT_GOAWAY,
     QUICHE_H3_EVENT_RESET,
+    QUICHE_H3_EVENT_PRIORITY_UPDATE,
 };
 
 typedef struct Http3Event quiche_h3_event;
@@ -739,6 +740,18 @@ ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
 // Reads request or response body data into the provided buffer.
 ssize_t quiche_h3_recv_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
                             uint64_t stream_id, uint8_t *out, size_t out_len);
+
+// Returns values contained in PRIORITY_UPDATE frame.
+//
+// The `cb` callback will be called once. `cb` should check the validity of
+// priority field value contents. If `cb` returns any value other than `0`,
+// processing will be interrupted and the value is returned to the caller.
+int quiche_h3_recv_priority_update(quiche_h3_conn *conn,
+                               int (*cb)(uint64_t prioritized_element_id,
+                                         uint8_t  *priority_field_value,
+                                         uint64_t priority_field_value_len,
+                                         void *argp),
+                               void *argp);
 
 // Returns whether the peer enabled HTTP/3 DATAGRAM frame support.
 bool quiche_h3_dgram_enabled_by_peer(quiche_h3_conn *conn,

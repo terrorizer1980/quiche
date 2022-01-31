@@ -139,6 +139,8 @@ pub extern fn quiche_h3_event_type(ev: &h3::Event) -> u32 {
         h3::Event::GoAway { .. } => 4,
 
         h3::Event::Reset { .. } => 5,
+
+        h3::Event::PriorityUpdate { .. } => 6,
     }
 }
 
@@ -284,6 +286,32 @@ pub extern fn quiche_h3_recv_body(
         Ok(v) => v as ssize_t,
 
         Err(e) => e.to_c(),
+    }
+}
+
+#[no_mangle]
+pub extern fn quiche_h3_recv_priority_update(
+    conn: &mut h3::Connection,
+    cb: extern fn(
+        prioritized_element_id: u64,
+        priority_field_value: *const u8,
+        priority_field_value_len: size_t,
+        argp: *mut c_void,
+    ) -> c_int,
+    argp: *mut c_void,
+) -> c_int {
+    match conn.recv_priority_update() {
+        Ok(p) => {
+            let rc = cb(p.0, p.1.as_ptr(), p.1.len(), argp);
+
+            if rc != 0 {
+                return rc;
+            }
+
+            0
+        },
+
+        Err(e) => e.to_c() as c_int,
     }
 }
 
