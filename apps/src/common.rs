@@ -903,13 +903,13 @@ impl Http3Conn {
     /// Builds an HTTP/3 response given a request.
     fn build_h3_response(
         root: &str, index: &str, request: &[quiche::h3::Header],
-    ) -> (Vec<quiche::h3::Header>, Vec<u8>, String) {
+    ) -> (Vec<quiche::h3::Header>, Vec<u8>, Vec<u8>) {
         let mut file_path = path::PathBuf::from(root);
         let mut scheme = "";
         let mut host = "";
         let mut path = "";
         let mut method = "";
-        let mut priority = "";
+        let mut priority = vec![];
 
         // Parse some of the request headers.
         for hdr in request {
@@ -923,8 +923,7 @@ impl Http3Conn {
 
                 b":method" => method = std::str::from_utf8(hdr.value()).unwrap(),
 
-                b"priority" =>
-                    priority = std::str::from_utf8(hdr.value()).unwrap(),
+                b"priority" => priority = hdr.value().to_vec(),
 
                 _ => (),
             }
@@ -936,7 +935,7 @@ impl Http3Conn {
                 quiche::h3::Header::new(b"server", b"quiche"),
             ];
 
-            return (headers, b"Invalid scheme".to_vec(), priority.to_string());
+            return (headers, b"Invalid scheme".to_vec(), priority);
         }
 
         let url = format!("{}://{}{}", scheme, host, path);
@@ -959,7 +958,9 @@ impl Http3Conn {
         }
 
         if !query_priority.is_empty() {
-            priority = &query_priority;
+            // remove trailing comma
+            query_priority.pop();
+            priority = query_priority.as_bytes().to_vec();
         }
 
         let (status, body) = match method {
@@ -990,11 +991,10 @@ impl Http3Conn {
         ];
 
         if !priority.is_empty() {
-            headers
-                .push(quiche::h3::Header::new(b"priority", priority.as_bytes()));
+            headers.push(quiche::h3::Header::new(b"priority", &priority));
         }
 
-        (headers, body, priority.to_string())
+        (headers, body, priority)
     }
 }
 
